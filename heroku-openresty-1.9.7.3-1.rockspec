@@ -3,7 +3,7 @@ package = "heroku-openresty"
 version = "1.9.7.3-1"
 
 source = {
-	url = "git://github.com/leafo/heroku-openresty.git"
+	url = "git://github.com/sumory/heroku-openresty.git"
 }
 
 description = {
