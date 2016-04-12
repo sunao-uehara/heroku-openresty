@@ -1,4 +1,4 @@
--- Copyright (C) 2012 Zhang "agentzh" Yichun (章亦春)
+-- Copyright (C) Yichun Zhang (agentzh)
 
 
 -- local socket = require "socket"
@@ -7,10 +7,10 @@ local udp = ngx.socket.udp
 local rand = math.random
 local char = string.char
 local byte = string.byte
-local strlen = string.len
 local find = string.find
 local gsub = string.gsub
-local substr = string.sub
+local sub = string.sub
+local rep = string.rep
 local format = string.format
 local band = bit.band
 local rshift = bit.rshift
@@ -23,12 +23,22 @@ local log = ngx.log
 local DEBUG = ngx.DEBUG
 local randomseed = math.randomseed
 local ngx_time = ngx.time
+local unpack = unpack
 local setmetatable = setmetatable
 local type = type
 
 
-local DOT_CHAR = byte(".")
+local ok, new_tab = pcall(require, "table.new")
+if not ok then
+    new_tab = function (narr, nrec) return {} end
+end
 
+
+local DOT_CHAR = byte(".")
+local ZERO_CHAR = byte("0")
+local COLON_CHAR = byte(":")
+
+local IP6_ARPA = "ip6.arpa"
 
 local TYPE_A      = 1
 local TYPE_NS     = 2
@@ -37,12 +47,14 @@ local TYPE_PTR    = 12
 local TYPE_MX     = 15
 local TYPE_TXT    = 16
 local TYPE_AAAA   = 28
+local TYPE_SRV    = 33
+local TYPE_SPF    = 99
 
 local CLASS_IN    = 1
 
 
 local _M = {
-    _VERSION    = '0.11',
+    _VERSION    = '0.14',
     TYPE_A      = TYPE_A,
     TYPE_NS     = TYPE_NS,
     TYPE_CNAME  = TYPE_CNAME,
@@ -50,6 +62,8 @@ local _M = {
     TYPE_MX     = TYPE_MX,
     TYPE_TXT    = TYPE_TXT,
     TYPE_AAAA   = TYPE_AAAA,
+    TYPE_SRV    = TYPE_SRV,
+    TYPE_SPF    = TYPE_SPF,
     CLASS_IN    = CLASS_IN,
 }
 
@@ -64,6 +78,17 @@ local resolver_errstrs = {
 
 
 local mt = { __index = _M }
+
+
+local arpa_tmpl = new_tab(72, 0)
+
+for i = 1, #IP6_ARPA do
+    arpa_tmpl[64 + i] = byte(IP6_ARPA, i)
+end
+
+for i = 2, 64, 2 do
+    arpa_tmpl[i] = DOT_CHAR
+end
 
 
 function _M.new(class, opts)
@@ -174,7 +199,7 @@ end
 
 
 local function _encode_name(s)
-    return char(strlen(s)) .. s
+    return char(#s) .. s
 end
 
 
@@ -217,7 +242,7 @@ local function _decode_name(buf, pos)
 
         else
             -- being a label
-            local label = substr(buf, p + 1, p + fst)
+            local label = sub(buf, p + 1, p + fst)
             insert(labels, label)
 
             -- print("resolved label ", label)
@@ -277,7 +302,7 @@ end
 
 
 local function parse_response(buf, id)
-    local n = strlen(buf)
+    local n = #buf
     if n < 12 then
         return nil, 'truncated';
     end
@@ -339,7 +364,7 @@ local function parse_response(buf, id)
 
     -- print("qname in reply: ", ans_qname)
 
-    -- print("question: ", substr(buf, 13, pos))
+    -- print("question: ", sub(buf, 13, pos))
 
     if pos + 3 + nan * 12 > n then
         -- print(format("%d > %d", pos + 3 + nan * 12, n))
@@ -420,7 +445,7 @@ local function parse_response(buf, id)
         local len_lo = byte(buf, pos + 9)
         local len = lshift(len_hi, 8) + len_lo
 
-        -- print("len: ", len)
+        -- print("record len: ", len)
 
         pos = pos + 10
 
@@ -510,6 +535,37 @@ local function parse_response(buf, id)
 
             pos = p
 
+        elseif typ == TYPE_SRV then
+            if len < 7 then
+                return nil, "bad SRV record value length: " .. len
+            end
+
+            local prio_hi = byte(buf, pos)
+            local prio_lo = byte(buf, pos + 1)
+            ans.priority = lshift(prio_hi, 8) + prio_lo
+
+            local weight_hi = byte(buf, pos + 2)
+            local weight_lo = byte(buf, pos + 3)
+            ans.weight = lshift(weight_hi, 8) + weight_lo
+
+            local port_hi = byte(buf, pos + 4)
+            local port_lo = byte(buf, pos + 5)
+            ans.port = lshift(port_hi, 8) + port_lo
+
+            local name, p = _decode_name(buf, pos + 6)
+            if not name then
+                return nil, pos
+            end
+
+            if p - pos ~= len then
+                return nil, format("bad srv record length: %d ~= %d",
+                                   p - pos, len)
+            end
+
+            ans.target = name
+
+            pos = p
+
         elseif typ == TYPE_NS then
 
             local name, p = _decode_name(buf, pos)
@@ -528,10 +584,45 @@ local function parse_response(buf, id)
 
             ans.nsdname = name
 
-        elseif typ == TYPE_TXT then
+        elseif typ == TYPE_TXT or typ == TYPE_SPF then
 
-            ans.txt = substr(buf, pos, pos + len - 1)
-            pos = pos + len
+            local key = (typ == TYPE_TXT) and "txt" or "spf"
+
+            local slen = byte(buf, pos)
+            if slen + 1 > len then
+                -- truncate the over-run TXT record data
+                slen = len
+            end
+
+            -- print("slen: ", len)
+
+            local val = sub(buf, pos + 1, pos + slen)
+            local last = pos + len
+            pos = pos + slen + 1
+
+            if pos < last then
+                -- more strings to be processed
+                -- this code path is usually cold, so we do not
+                -- merge the following loop on this code path
+                -- with the processing logic above.
+
+                val = {val}
+                local idx = 2
+                repeat
+                    local slen = byte(buf, pos)
+                    if pos + slen + 1 > last then
+                        -- truncate the over-run TXT record data
+                        slen = last - pos - 1
+                    end
+
+                    val[idx] = sub(buf, pos + 1, pos + slen)
+                    idx = idx + 1
+                    pos = pos + slen + 1
+
+                until pos >= last
+            end
+
+            ans[key] = val
 
         elseif typ == TYPE_PTR then
 
@@ -554,7 +645,7 @@ local function parse_response(buf, id)
         else
             -- for unknown types, just forward the raw value
 
-            ans.rdata = substr(buf, pos, pos + len - 1)
+            ans.rdata = sub(buf, pos, pos + len - 1)
             pos = pos + len
         end
     end
@@ -589,7 +680,7 @@ local function _tcp_query(self, query, id)
     end
 
     query = concat(query, "")
-    local len = strlen(query)
+    local len = #query
 
     local len_hi = char(rshift(len, 8))
     local len_lo = char(band(len, 0xff))
@@ -725,6 +816,70 @@ function _M.compress_ipv6_addr(addr)
     end
 
     return addr
+end
+
+
+local function _expand_ipv6_addr(addr)
+    if find(addr, "::", 1, true) then
+        local ncol, addrlen = 8, #addr
+
+        for i = 1, addrlen do
+            if byte(addr, i) == COLON_CHAR then
+                ncol = ncol - 1
+            end
+        end
+
+        if byte(addr, 1) == COLON_CHAR then
+            addr = "0" .. addr
+        end
+
+        if byte(addr, -1) == COLON_CHAR then
+            addr = addr .. "0"
+        end
+
+        addr = re_sub(addr, "::", ":" .. rep("0:", ncol), "jo")
+    end
+
+    return addr
+end
+
+
+_M.expand_ipv6_addr = _expand_ipv6_addr
+
+
+function _M.arpa_str(addr)
+    if find(addr, ":", 1, true) then
+        addr = _expand_ipv6_addr(addr)
+        local idx, hidx, addrlen = 1, 1, #addr
+
+        for i = addrlen, 0, -1 do
+            local s = byte(addr, i)
+            if s == COLON_CHAR or not s then
+                for j = hidx, 4 do
+                    arpa_tmpl[idx] = ZERO_CHAR
+                    idx = idx + 2
+                end
+                hidx = 1
+            else
+                arpa_tmpl[idx] = s
+                idx = idx + 2
+                hidx = hidx + 1
+            end
+        end
+
+        addr = char(unpack(arpa_tmpl))
+    else
+        addr = re_sub(addr, [[(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})]],
+                      "$4.$3.$2.$1.in-addr.arpa", "ajo")
+    end
+
+    return addr
+end
+
+
+function _M.reverse_query(self, addr)
+    return self.query(self, self.arpa_str(addr),
+                      {qtype = self.TYPE_PTR})
 end
 
 

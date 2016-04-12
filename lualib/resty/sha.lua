@@ -1,12 +1,10 @@
--- Copyright (C) 2012 by Yichun Zhang (agentzh)
+-- Copyright (C) by Yichun Zhang (agentzh)
 
 
 local ffi = require "ffi"
 
 
-module(...)
-
-_VERSION = '0.08'
+local _M = { _VERSION = '0.09' }
 
 
 ffi.cdef[[
@@ -18,3 +16,4 @@ enum {
 };
 ]];
 
+return _M

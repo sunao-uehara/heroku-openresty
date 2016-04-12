@@ -1,4 +1,4 @@
--- Copyright (C) 2013 Yichun Zhang (agentzh)
+-- Copyright (C) Yichun Zhang (agentzh)
 
 
 local ffi = require "ffi"
@@ -12,7 +12,7 @@ local getmetatable = getmetatable
 local tonumber = tonumber
 
 
-local _M = { _VERSION = '0.02' }
+local _M = { _VERSION = '0.04' }
 local mt = { __index = _M }
 
 
@@ -53,22 +53,24 @@ if debug then _M.unref_obj = unref_obj end
 
 
 local function gc_lock(cdata)
+    local dict_id = tonumber(cdata.dict_id)
     local key_id = tonumber(cdata.key_id)
+
     -- print("key_id: ", key_id, ", key: ", memo[key_id], "dict: ",
     --       type(memo[cdata.dict_id]))
     if key_id > 0 then
         local key = memo[key_id]
         unref_obj(key_id)
-        local dict_id = cdata.dict_id
         local dict = memo[dict_id]
-        unref_obj(dict_id)
         -- print("dict.delete type: ", type(dict.delete))
         local ok, err = dict:delete(key)
         if not ok then
-            ngx.log(ngx.ERR, "failed to delete ", key)
+            ngx.log(ngx.ERR, 'failed to delete key "', key, '": ', err)
         end
         cdata.key_id = 0
     end
+
+    unref_obj(dict_id)
 end
 
 
@@ -185,7 +187,6 @@ end
 function _M.unlock(self)
     local dict = self.dict
     local cdata = self.cdata
-    unref_obj(cdata.dict_id)
     local key_id = tonumber(cdata.key_id)
     if key_id <= 0 then
         return nil, "unlocked"
