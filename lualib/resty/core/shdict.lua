@@ -1,4 +1,4 @@
--- Copyright (C) 2013 Yichun Zhang (agentzh)
+-- Copyright (C) Yichun Zhang (agentzh)
 
 
 local ffi = require 'ffi'
@@ -33,6 +33,8 @@ ffi.cdef[[
         const unsigned char *str_value_buf, size_t str_value_len,
         double num_value, int exptime, int user_flags, char **errmsg,
         int *forcible);
+
+    int ngx_http_lua_ffi_shdict_flush_all(void *zone);
 ]]
 
 
@@ -52,13 +54,27 @@ local str_value_buf = ffi_new("unsigned char *[1]")
 local errmsg = base.get_errmsg_ptr()
 
 
-local function shdict_store(zone, op, key, value, exptime, flags)
-    if not zone or type(zone) ~= "userdata" then
-        return error('bad "zone" argument')
+local function check_zone(zone)
+    if not zone or type(zone) ~= "table" then
+        return error("bad \"zone\" argument")
     end
+
+    zone = zone[1]
+    if type(zone) ~= "userdata" then
+        return error("bad \"zone\" argument")
+    end
+
+    return zone
+end
+
+
+local function shdict_store(zone, op, key, value, exptime, flags)
+    zone = check_zone(zone)
 
     if not exptime then
         exptime = 0
+    elseif exptime < 0 then
+        return error('bad "exptime" argument')
     end
 
     if not flags then
@@ -157,9 +173,7 @@ end
 
 
 local function shdict_get(zone, key)
-    if not zone or type(zone) ~= "userdata" then
-        return error('bad "zone" argument')
-    end
+    zone = check_zone(zone)
 
     if key == nil then
         return nil, "nil key"
@@ -230,9 +244,7 @@ end
 
 
 local function shdict_get_stale(zone, key)
-    if not zone or type(zone) ~= "userdata" then
-        return error("bad \"zone\" argument")
-    end
+    zone = check_zone(zone)
 
     if key == nil then
         return nil, "nil key"
@@ -302,9 +314,7 @@ end
 
 
 local function shdict_incr(zone, key, value)
-    if not zone or type(zone) ~= "userdata" then
-        return error("bad \"zone\" argument")
-    end
+    zone = check_zone(zone)
 
     if key == nil then
         return nil, "nil key"
@@ -337,6 +347,13 @@ local function shdict_incr(zone, key, value)
 end
 
 
+local function shdict_flush_all(zone)
+    zone = check_zone(zone)
+
+    C.ngx_http_lua_ffi_shdict_flush_all(zone)
+end
+
+
 if ngx_shared then
     local name, dict = next(ngx_shared, nil)
     if dict then
@@ -353,6 +370,7 @@ if ngx_shared then
                 mt.safe_add = shdict_safe_add
                 mt.replace = shdict_replace
                 mt.delete = shdict_delete
+                mt.flush_all = shdict_flush_all
             end
         end
     end

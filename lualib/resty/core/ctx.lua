@@ -1,4 +1,4 @@
--- Copyright (C) 2013 Yichun Zhang (agentzh)
+-- Copyright (C) Yichun Zhang (agentzh)
 
 
 local ffi = require 'ffi'
@@ -16,6 +16,7 @@ local getfenv = getfenv
 local C = ffi.C
 local FFI_NO_REQ_CTX = base.FFI_NO_REQ_CTX
 local FFI_OK = base.FFI_OK
+local error = error
 
 
 ffi.cdef[[

@@ -1,11 +1,10 @@
--- Copyright (C) 2013 Yichun Zhang (agentzh)
+-- Copyright (C) Yichun Zhang (agentzh)
 
 
 local ffi = require 'ffi'
 local ffi_string = ffi.string
 local ffi_new = ffi.new
 local C = ffi.C
-local setmetatable = setmetatable
 local ngx = ngx
 local type = type
 local tostring = tostring

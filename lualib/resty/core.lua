@@ -1,4 +1,4 @@
--- Copyright (C) 2013 Yichun Zhang (agentzh)
+-- Copyright (C) Yichun Zhang (agentzh)
 
 
 require "resty.core.uri"
@@ -12,6 +12,8 @@ require "resty.core.ctx"
 require "resty.core.misc"
 require "resty.core.request"
 require "resty.core.response"
+require "resty.core.time"
+require "resty.core.worker"
 
 
 local base = require "resty.core.base"

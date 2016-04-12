@@ -1,4 +1,4 @@
--- Copyright (C) 2013 Yichun Zhang (agentzh)
+-- Copyright (C) Yichun Zhang (agentzh)
 
 
 local ffi = require 'ffi'
@@ -6,11 +6,14 @@ local base = require "resty.core.base"
 
 
 local FFI_BAD_CONTEXT = base.FFI_BAD_CONTEXT
+local FFI_DECLINED = base.FFI_DECLINED
+local FFI_OK = base.FFI_OK
 local new_tab = base.new_tab
 local C = ffi.C
 local ffi_cast = ffi.cast
 local ffi_str = ffi.string
 local get_string_buf = base.get_string_buf
+local get_size_ptr = base.get_size_ptr
 local setmetatable = setmetatable
 local gsub = ngx.re.gsub
 local lower = string.lower
@@ -18,6 +21,9 @@ local rawget = rawget
 local ngx = ngx
 local getfenv = getfenv
 local type = type
+local error = error
+local tostring = tostring
+local tonumber = tonumber
 
 
 ffi.cdef[[
@@ -39,6 +45,19 @@ ffi.cdef[[
 
     int ngx_http_lua_ffi_req_get_uri_args(ngx_http_request_t *r,
         unsigned char *buf, ngx_http_lua_ffi_table_elt_t *out, int count);
+
+    double ngx_http_lua_ffi_req_start_time(ngx_http_request_t *r);
+
+    int ngx_http_lua_ffi_req_get_method(ngx_http_request_t *r);
+
+    int ngx_http_lua_ffi_req_get_method_name(ngx_http_request_t *r,
+        char *name, size_t *len);
+
+    int ngx_http_lua_ffi_req_set_method(ngx_http_request_t *r, int method);
+
+    int ngx_http_lua_ffi_req_header_set_single_value(ngx_http_request_t *r,
+        const unsigned char *key, size_t key_len, const unsigned char *value,
+        size_t value_len);
 ]]
 
 
@@ -167,6 +186,163 @@ function ngx.req.get_uri_args(max_args)
         end
     end
     return args
+end
+
+
+function ngx.req.start_time()
+    local r = getfenv(0).__ngx_req
+    if not r then
+        return error("no request found")
+    end
+
+    return tonumber(C.ngx_http_lua_ffi_req_start_time(r))
+end
+
+
+do
+    local methods = {
+        [0x0002] = "GET",
+        [0x0004] = "HEAD",
+        [0x0008] = "POST",
+        [0x0010] = "PUT",
+        [0x0020] = "DELETE",
+        [0x0040] = "MKCOL",
+        [0x0080] = "COPY",
+        [0x0100] = "MOVE",
+        [0x0200] = "OPTIONS",
+        [0x0400] = "PROPFIND",
+        [0x0800] = "PROPPATCH",
+        [0x1000] = "LOCK",
+        [0x2000] = "UNLOCK",
+        [0x4000] = "PATCH",
+        [0x8000] = "TRACE",
+    }
+
+    function ngx.req.get_method()
+        local r = getfenv(0).__ngx_req
+        if not r then
+            return error("no request found")
+        end
+
+        do
+            local id = C.ngx_http_lua_ffi_req_get_method(r)
+            if id == FFI_BAD_CONTEXT then
+                return error("API disabled in the current context")
+            end
+
+            local method = methods[id]
+            if method then
+                return method
+            end
+        end
+
+        local buf = get_string_buf(32)
+        local sizep = get_size_ptr()
+        sizep[0] = 32
+
+        local rc = C.ngx_http_lua_ffi_req_get_method_name(r, buf, sizep)
+        if rc ~= 0 then
+            return nil
+        end
+
+        return ffi_str(buf, sizep[0])
+    end
+end  -- do
+
+
+function ngx.req.set_method(method)
+    local r = getfenv(0).__ngx_req
+    if not r then
+        return error("no request found")
+    end
+
+    if type(method) ~= "number" then
+        return error("bad method number")
+    end
+
+    local rc = C.ngx_http_lua_ffi_req_set_method(r, method)
+    if rc == FFI_OK then
+        return
+    end
+
+    if rc == FFI_BAD_CONTEXT then
+        return error("API disabled in the current context")
+    end
+
+    if rc == FFI_DECLINED then
+        return error("unsupported HTTP method: " .. method)
+    end
+
+    return error("unknown error: " .. rc)
+end
+
+
+do
+    local orig_func = ngx.req.set_header
+
+    function ngx.req.set_header(name, value)
+        if type(value) == "table" then
+            return orig_func(name, value)
+        end
+
+        local r = getfenv(0).__ngx_req
+        if not r then
+            return error("no request found")
+        end
+
+        if type(name) ~= "string" then
+            name = tostring(name)
+        end
+
+        local rc
+        if not value then
+            rc = C.ngx_http_lua_ffi_req_header_set_single_value(r, name,
+                                                         #name, nil, 0)
+
+        else
+            if type(value) ~= "string" then
+                value = tostring(value)
+            end
+
+            rc = C.ngx_http_lua_ffi_req_header_set_single_value(r, name,
+                                                         #name, value, #value)
+        end
+
+        if rc == FFI_OK or rc == FFI_DECLINED then
+            return
+        end
+
+        if rc == FFI_BAD_CONTEXT then
+            return error("API disabled in the current context")
+        end
+
+        return error("error")
+    end
+end  -- do
+
+
+function ngx.req.clear_header(name)
+    local r = getfenv(0).__ngx_req
+    if not r then
+        return error("no request found")
+    end
+
+    if type(name) ~= "string" then
+        name = tostring(name)
+    end
+
+    local rc = C.ngx_http_lua_ffi_req_header_set_single_value(r, name, #name,
+                                                                       nil, 0)
+
+    if rc == FFI_OK or rc == FFI_DECLINED then
+        return
+    end
+
+    if rc == FFI_BAD_CONTEXT then
+        return error("API disabled in the current context")
+    end
+
+    return error("error")
 end
 
 

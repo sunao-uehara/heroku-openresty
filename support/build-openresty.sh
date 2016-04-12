@@ -1,8 +1,8 @@
 #!/bin/bash
 
 base_dir=$(pwd)
-openresty_tar="ngx_openresty-1.5.11.1.tar.gz"
-pcre_tar="pcre-8.33.tar.gz"
+openresty_tar="ngx_openresty-1.9.7.4.tar.gz"
+pcre_tar="pcre-8.38.tar.gz"
 
 echo "$(tput setaf 2)Downloading openresty...$(tput sgr0)"
 curl -O -L "http://openresty.org/download/$openresty_tar"

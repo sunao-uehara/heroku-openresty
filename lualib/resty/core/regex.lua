@@ -1,10 +1,14 @@
--- Copyright (C) 2013 Yichun Zhang (agentzh)
+-- Copyright (C) Yichun Zhang (agentzh)
 
 
 local ffi = require 'ffi'
 local base = require "resty.core.base"
 local bit = require "bit"
+require "resty.core.time"  -- for ngx.now used by resty.lrucache
+local lrucache = require "resty.lrucache"
 
+local lrucache_get = lrucache.get
+local lrucache_set = lrucache.set
 local ffi_string = ffi.string
 local ffi_new = ffi.new
 local ffi_gc = ffi.gc
@@ -62,11 +66,12 @@ local PCRE_JAVASCRIPT_COMPAT = 0x2000000
 local PCRE_ERROR_NOMATCH = -1
 
 
-local regex_cache = new_tab(0, 4)
+local regex_match_cache
+local regex_sub_func_cache = new_tab(0, 4)
+local regex_sub_str_cache = new_tab(0, 4)
 local max_regex_cache_size
 local regex_cache_size = 0
 local script_engine
-local tmp_captures = new_tab(4, 4)
 
 
 ffi.cdef[[
@@ -89,6 +94,8 @@ ffi.cdef[[
         void                         *regex_sd;
 
         ngx_http_lua_complex_value_t *replace;
+
+        const char                   *pattern;
     } ngx_http_lua_regex_t;
 
     ngx_http_lua_regex_t *
@@ -229,17 +236,18 @@ local function collect_named_captures(compiled, flags, res)
         -- ngx.say("n = ", n)
         local name = ffi_string(name_table + ind + 2)
         local cap = res[n]
-        if cap then
-            if dup_names then
+        if dup_names then
+            -- unmatched captures (false) are not collected
+            if cap then
                 local old = res[name]
                 if old then
                     old[#old + 1] = cap
                 else
                     res[name] = {cap}
                 end
-            else
-                res[name] = cap
             end
+        else
+            res[name] = cap
         end
 
         ind = ind + entry_size
@@ -249,19 +257,26 @@ end
 
 local function collect_captures(compiled, rc, subj, flags, res)
     local cap = compiled.captures
+    local ncap = compiled.ncaptures
     local name_count = compiled.name_count
 
     if not res then
-        res = new_tab(rc, name_count)
+        res = new_tab(ncap, name_count)
     end
 
     local i = 0
     local n = 0
-    while i < rc do
-        local from = cap[n]
-        if from >= 0 then
-            local to = cap[n + 1]
-            res[i] = sub(subj, from + 1, to)
+    while i <= ncap do
+        if i > rc then
+            res[i] = false
+        else
+            local from = cap[n]
+            if from >= 0 then
+                local to = cap[n + 1]
+                res[i] = sub(subj, from + 1, to)
+            else
+                res[i] = false
+            end
         end
         i = i + 1
         n = n + 2
@@ -276,12 +291,6 @@ end
 
 
 local function destroy_compiled_regex(compiled)
-    -- below is a temporary assertion for tracing an issue in LuaJIT v2.1.
-    if C == nil then
-        ngx_log(ngx_ERR, "value of 'C' is nil, prepare for crash")
-    end
-    assert(C ~= nil)
-
     C.ngx_http_lua_ffi_destroy_regex(ffi_gc(compiled, nil))
 end
 
@@ -296,12 +305,23 @@ local function re_match_compile(regex, opts)
         opts = ""
     end
 
-    local key, compiled
+    local compiled, key
     local compile_once = (band(flags, FLAG_COMPILE_ONCE) == 1)
+
+    -- FIXME: better put this in the outer scope when fixing the ngx.re API's
+    -- compatibility in the init_by_lua* context.
+    if not regex_match_cache then
+        local sz = get_max_regex_cache_size()
+        if sz <= 0 then
+            compile_once = false
+        else
+            regex_match_cache = lrucache.new(sz)
+        end
+    end
+
     if compile_once then
-        key = regex .. "\0" .. pcre_opts
-        -- print("key: ", key)
-        compiled = regex_cache[key]
+        key = regex .. '\0' .. opts
+        compiled = lrucache_get(regex_match_cache, key)
     end
 
     -- compile the regex
@@ -323,13 +343,8 @@ local function re_match_compile(regex, opts)
         -- print("ncaptures: ", compiled.ncaptures)
 
         if compile_once then
-            if regex_cache_size < get_max_regex_cache_size() then
-                -- print("inserting compiled regex into cache")
-                regex_cache[key] = compiled
-                regex_cache_size = regex_cache_size + 1
-            else
-                compile_once = false
-            end
+            -- print("inserting compiled regex into cache")
+            lrucache_set(regex_match_cache, key, compiled)
         end
     end
 
@@ -338,6 +353,10 @@ end
 
 
 local function re_match_helper(subj, regex, opts, ctx, want_caps, res, nth)
+    -- we need to cast this to strings to avoid exceptions when they are
+    -- something else.
+    subj  = tostring(subj)
+
     local compiled, compile_once, flags = re_match_compile(regex, opts)
     if compiled == nil then
         -- compiled_once holds the error string
@@ -460,13 +479,13 @@ local function new_script_engine(subj, compiled, count)
 end
 
 
-local function check_buf_size(buf, buf_size, pos, len, new_len)
+local function check_buf_size(buf, buf_size, pos, len, new_len, must_alloc)
     if new_len > buf_size then
         buf_size = buf_size * buf_grow_ratio
         if buf_size < new_len then
             buf_size = new_len
         end
-        local new_buf = get_string_buf(buf_size)
+        local new_buf = get_string_buf(buf_size, must_alloc)
         ffi_copy(new_buf, buf, len)
         buf = new_buf
         pos = buf + len
@@ -485,16 +504,26 @@ local function re_sub_compile(regex, opts, replace, func)
         opts = ""
     end
 
-    local key, compiled
+    local compiled
     local compile_once = (band(flags, FLAG_COMPILE_ONCE) == 1)
     if compile_once then
         if func then
-            key = regex .. "\0" .. pcre_opts
+            local subcache = regex_sub_func_cache[opts]
+            if subcache then
+                -- print("cache hit!")
+                compiled = subcache[regex]
+            end
+
         else
-            key = regex .. "\0" .. pcre_opts .. "\0" .. replace
+            local subcache = regex_sub_str_cache[opts]
+            if subcache then
+                local subsubcache = subcache[regex]
+                if subsubcache then
+                    -- print("cache hit!")
+                    compiled = subsubcache[replace]
+                end
+            end
         end
-        -- print("key: ", key)
-        compiled = regex_cache[key]
     end
 
     -- compile the regex
@@ -530,7 +559,32 @@ local function re_sub_compile(regex, opts, replace, func)
         if compile_once then
             if regex_cache_size < get_max_regex_cache_size() then
                 -- print("inserting compiled regex into cache")
-                regex_cache[key] = compiled
+                if func then
+                    local subcache = regex_sub_func_cache[opts]
+                    if not subcache then
+                        regex_sub_func_cache[opts] = {[regex] = compiled}
+
+                    else
+                        subcache[regex] = compiled
+                    end
+
+                else
+                    local subcache = regex_sub_str_cache[opts]
+                    if not subcache then
+                        regex_sub_str_cache[opts] =
+                            {[regex] = {[replace] = compiled}}
+
+                    else
+                        local subsubcache = subcache[regex]
+                        if not subsubcache then
+                            subcache[regex] = {[replace] = compiled}
+
+                        else
+                            subsubcache[replace] = compiled
+                        end
+                    end
+                end
+
                 regex_cache_size = regex_cache_size + 1
             else
                 compile_once = false
@@ -552,13 +606,17 @@ local function re_sub_func_helper(subj, regex, replace, opts, global)
 
     -- exec the compiled regex
 
+    subj = tostring(subj)
     local subj_len = #subj
     local count = 0
     local pos = 0
     local cp_pos = 0
 
     local dst_buf_size = get_string_buf_size()
-    local dst_buf = get_string_buf(dst_buf_size)
+    -- Note: we have to always allocate the string buffer because
+    -- the user might call whatever resty.core's API functions recursively
+    -- in the user callback function.
+    local dst_buf = get_string_buf(dst_buf_size, true)
     local dst_pos = dst_buf
     local dst_len = 0
 
@@ -590,15 +648,15 @@ local function re_sub_func_helper(subj, regex, replace, opts, global)
         count = count + 1
         local prefix_len = compiled.captures[0] - cp_pos
 
-        local res = collect_captures(compiled, rc, subj, flags, tmp_captures)
+        local res = collect_captures(compiled, rc, subj, flags)
 
-        local bit = replace(res)
+        local bit = tostring(replace(res))
         local bit_len = #bit
 
         local new_dst_len = dst_len + prefix_len + bit_len
         dst_buf, dst_buf_size, dst_pos, dst_len =
             check_buf_size(dst_buf, dst_buf_size, dst_pos, dst_len,
-                           new_dst_len)
+                           new_dst_len, true)
 
         if prefix_len > 0 then
             ffi_copy(dst_pos, ffi_cast(c_str_type, subj) + cp_pos,
@@ -636,7 +694,7 @@ local function re_sub_func_helper(subj, regex, replace, opts, global)
             local new_dst_len = dst_len + suffix_len
             dst_buf, dst_buf_size, dst_pos, dst_len =
                 check_buf_size(dst_buf, dst_buf_size, dst_pos, dst_len,
-                               new_dst_len)
+                               new_dst_len, true)
 
             ffi_copy(dst_pos, ffi_cast(c_str_type, subj) + cp_pos,
                      suffix_len)
@@ -658,6 +716,7 @@ local function re_sub_str_helper(subj, regex, replace, opts, global)
 
     -- exec the compiled regex
 
+    subj = tostring(subj)
     local subj_len = #subj
     local count = 0
     local pos = 0
