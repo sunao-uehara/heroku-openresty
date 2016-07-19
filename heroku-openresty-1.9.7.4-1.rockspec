@@ -73,6 +73,7 @@ build = {
 			["resty.websocket.client"] = "lualib/resty/websocket/client.lua",
 			["resty.websocket.protocol"] = "lualib/resty/websocket/protocol.lua",
 			["resty.websocket.server"] = "lualib/resty/websocket/server.lua",
+			["resty.mongol"] = "lualib/resty/mongol/init.lua",
 		},
 	}
 }
